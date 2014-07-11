@@ -1,0 +1,86 @@
+#! /usr/local/bin/python
+# Runs Sundays to manually prune all of the volumes.  Bacula only prunes jobs related to the Job just completed.  If you disable a host, no Job for that host will ever run again, and the backups will just hang around forever.
+
+'''Cleanup after jobs/clients that have vanished without pruning.
+
+For active jobs, pruning isn't an issue because we use auto-pruning (i.e. a
+job-specific prune runs at the completion of each job run).  However, when
+you remove a job, no auto-prune will ever be run for it again, which means
+that all of the volumes that exist at the time the job is remove will never
+be cleaned up properly.  Run this once a quarter or so to clean up.
+
+It must be run as root.  Sudo generally times out due to the times invovled
+here. Sorry.
+'''
+
+
+import sys, os, popen2
+from stat import *
+from clint.textui import progress
+BCONSOLE = '/usr/local/sbin/bconsole'
+
+def get_media(pool = None):
+    data = []
+    if pool: query = 'media pool=%s' % pool
+    else: query = 'pool'
+    for line in os.popen('echo list %s | %s' % (query,BCONSOLE)):
+        if not line[0] == '|': continue
+        bits = [x.strip() for x in line.split('|')]
+        if 'Id' in bits[1]: continue # This field is numeric, so 'Id' indicates a header row
+        data.append(bits)
+    return sorted(data)
+
+def out(*msg):
+    '''Unbuffered equivalent of print.
+
+    When you're printing stuff out with a long-running process, it's nice
+    to see that you're making progress.
+    '''
+    for m in msg: sys.stdout.write(m)
+    sys.stdout.flush()
+        
+
+def prune_commands(medialist):
+    '''Convert a list of media into a list of commands for pruning the media.'''
+    retval = []
+    if medialist:
+        for volume in medialist:
+            if volume[3] in ('Purged', 'Archive', 'Recycle', 'Disabled', 'Busy', 'Cleaning'): continue
+            retval.append('prune volume=%s yes' % volume[2])
+    return retval
+
+def clean_one(filter_set=None):
+    # Pools to clean
+    pools = get_media()
+    commands = []
+    for p in pools:
+        poolname = p[2]
+        if filter_set:
+            use_pool = False
+            for filter in filter_set:
+                if filter in poolname: use_pool = True
+            if not use_pool: continue
+        print "searching through %20s" % poolname,
+        media = get_media(poolname)
+        sys.stdout.flush()
+        commands.append((poolname, prune_commands(media)))
+        print " found %d(%d) records" % (len(commands[-1][-1]), len(media))
+        pass
+
+    # Actually do the pruning here
+    for poolname, pool in commands:
+        (child_stdout, child_stdin) = popen2.popen2(BCONSOLE, bufsize=0)
+        for d in range(0,3): child_stdout.readline() #  eat initial messages
+        for cmd in progress.bar(pool, label="  cleaning the %s pool " % poolname):
+            child_stdin.write('%s\n' % cmd)
+            child_stdout.readline() # Eat the echoed command
+            while 'MyCatalog' in child_stdout.readline(): pass # Eat catalog lines plus one more
+        child_stdin.write('quit\n')
+        child_stdin.close()
+        i = 0
+        for line in child_stdout:
+            i += 1
+            if not line: break
+    return
+
+clean_one(sys.argv[1:])
